@@ -1,0 +1,1178 @@
+---
+title: "Module 5 — Classification Models & Clustering"
+subtitle: "Applied Machine Learning for Marketing"
+author: "Jae Jung"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-expand: 1
+    toc-location: right-body
+    toc-title: "Contents"
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    theme: cosmo
+    highlight-style: github
+    df-print: kable
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  # freeze: true  # Turn back on after the notebook renders cleanly
+---
+
+# Learning Objectives {.unnumbered}
+
+By the end of this notebook you will be able to:
+
+1.  Explain the intuition behind LDA, QDA, Naïve Bayes, and KNN and identify when each is appropriate
+2.  Fit all four classifiers in tidymodels using a shared recipe and workflow
+3.  Apply Poisson regression to predict count outcomes common in marketing data
+4.  Compare classifiers systematically using `fit_resamples()` and `collect_metrics()`
+5.  Perform k-means clustering, choose k using elbow and silhouette methods, and profile resulting segments in marketing terms
+6.  Articulate the distinction between supervised classification and unsupervised clustering
+
+> **Textbook references:** ISLR Chapter 4 (Classification); TMWR Chapter 15 (Dimensionality Reduction — context for unsupervised learning)
+
+------------------------------------------------------------------------
+
+# Setup
+
+```{r setup}
+# Install packages once if needed:
+# install.packages(c(
+#   "tidymodels", "tidyverse", "discrim", "klaR", "kknn",
+#   "factoextra", "patchwork", "poissonreg", "broom"
+# ))
+
+library(tidymodels)
+library(tidyverse)
+library(discrim) # LDA/QDA/Naive Bayes model specifications
+library(klaR) # Naive Bayes engine
+library(kknn) # KNN engine
+library(factoextra) # elbow + silhouette plots for k-means
+library(patchwork) # combining plots
+library(poissonreg) # poisson_reg() parsnip model specification
+library(broom) # tidy() model summaries
+
+tidymodels_prefer()
+
+set.seed(2025)
+```
+
+::: {.callout-note title="Package installation"}
+If any packages are not yet installed, run this once in the Console:
+
+``` r
+install.packages(c(
+  "tidymodels", "tidyverse", "discrim", "klaR", "kknn",
+  "factoextra", "patchwork", "poissonreg", "broom"
+))
+```
+
+Two common render errors in this module are caused by missing extension packages:
+
+-   `naive_Bayes()` with `set_engine("klaR")` needs the **klaR** package.
+-   `poisson_reg()` needs the **poissonreg** package.
+:::
+
+------------------------------------------------------------------------
+
+# The E-Commerce Dataset
+
+## Data Generation
+
+We simulate 2,000 e-commerce customers. Two outcome variables serve as targets throughout this module:
+
+-   **`purchase_category`** — the customer's dominant purchase category (`apparel`, `electronics`, `beauty`) — used for multi-class classification
+
+-   **`num_orders`** — the number of orders placed in the past 12 months — used for Poisson regression
+
+```{r generate-data}
+set.seed(2025)
+n <- 2000
+
+ecom_data <- tibble(
+  customer_id = paste0("E", str_pad(1:n, 5, pad = "0")),
+  age = round(rnorm(n, mean = 34, sd = 10)),
+  income = round(rlnorm(n, meanlog = 10.7, sdlog = 0.55)),
+  browsing_mins = round(pmax(1, rnorm(n, mean = 18, sd = 8)), 1),
+  pages_viewed = round(pmax(1, rnorm(n, mean = 6, sd = 3))),
+  days_since_visit = round(pmax(0, rexp(n, rate = 1 / 14))),
+  cart_abandon_rate = round(pmin(1, pmax(0, rnorm(n, 0.55, 0.18))), 2),
+  device = sample(
+    c("mobile", "desktop", "tablet"),
+    n,
+    replace = TRUE,
+    prob = c(0.55, 0.35, 0.10)
+  ),
+  referral_source = sample(
+    c("organic", "paid_search", "social", "email"),
+    n,
+    replace = TRUE,
+    prob = c(0.30, 0.25, 0.30, 0.15)
+  ),
+  loyalty_member = sample(
+    c("yes", "no"),
+    n,
+    replace = TRUE,
+    prob = c(0.35, 0.65)
+  )
+) |>
+  mutate(
+    # num_orders — Poisson count driven by engagement and loyalty
+    num_orders = rpois(
+      n,
+      lambda = exp(
+        0.8 +
+          0.04 * browsing_mins +
+          0.08 * pages_viewed -
+          0.015 * days_since_visit -
+          0.5 * cart_abandon_rate +
+          if_else(loyalty_member == "yes", 0.6, 0)
+      )
+    ),
+
+    # purchase_category — multi-class outcome driven by age, income, device
+    purchase_category = case_when(
+      # electronics: higher income, older, desktop users
+      income > 65000 & age > 30 & device == "desktop" ~ "electronics",
+      # beauty: younger, mobile, social referral
+      age < 32 & device == "mobile" ~ "beauty",
+      # apparel: middle ground + noise
+      TRUE ~ sample(
+        c("apparel", "electronics", "beauty"),
+        n,
+        replace = TRUE,
+        prob = c(0.50, 0.25, 0.25)
+      )
+    ),
+
+    # Introduce some deliberate noise for realism
+    purchase_category = if_else(
+      runif(n) < 0.15,
+      sample(c("apparel", "electronics", "beauty"), n, replace = TRUE),
+      purchase_category
+    ),
+
+    # Encode factors
+    purchase_category = factor(
+      purchase_category,
+      levels = c("apparel", "electronics", "beauty")
+    ),
+    device = factor(device),
+    referral_source = factor(referral_source),
+    loyalty_member = factor(loyalty_member)
+  )
+
+glimpse(ecom_data)
+```
+
+## Exploratory Overview
+
+```{r eda}
+# Class distribution — purchase category
+ecom_data |>
+  count(purchase_category) |>
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+# Distribution of num_orders
+ecom_data |>
+  ggplot(aes(x = num_orders)) +
+  geom_histogram(bins = 20, fill = "#154734", color = "white") +
+  labs(
+    title = "Distribution of Number of Orders (Count Outcome)",
+    subtitle = "Right-skewed — typical of count data; Poisson regression is appropriate",
+    x = "Number of orders (past 12 months)",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Purchase category by device
+ecom_data |>
+  count(device, purchase_category) |>
+  group_by(device) |>
+  mutate(pct = round(n / sum(n) * 100, 1)) |>
+  ggplot(aes(x = device, y = pct, fill = purchase_category)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("#154734", "#B08D57", "#4F8A8B")) +
+  labs(
+    title = "Purchase Category by Device",
+    x = "Device",
+    y = "Percentage (%)",
+    fill = "Category"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+::: {.callout-note title="Marketing context"}
+We have two prediction tasks in this module:
+
+1.  **Which category will this customer buy from next?** — a 3-class classification problem answered by LDA, QDA, Naïve Bayes, and KNN
+2.  **How many orders will this customer place?** — a count regression problem answered by Poisson regression
+
+A third question — **what natural segments exist in this customer base?** — has no labeled outcome at all, which is why we need k-means clustering.
+:::
+
+------------------------------------------------------------------------
+
+# Train/Test Split and Shared Recipe
+
+## Split
+
+```{r split}
+set.seed(617)
+ecom_split <- initial_split(ecom_data, prop = 0.80, strata = purchase_category)
+ecom_train <- training(ecom_split)
+ecom_test <- testing(ecom_split)
+
+cat("Training rows:", nrow(ecom_train), "\n")
+cat("Test rows    :", nrow(ecom_test), "\n")
+```
+
+## Shared Recipe for Classification
+
+All four classifiers share the same preprocessing recipe. This is important — fair comparison requires identical feature engineering across models.
+
+```{r recipe}
+ecom_rec <- recipe(
+  purchase_category ~ customer_id +
+    age +
+    income +
+    browsing_mins +
+    pages_viewed +
+    days_since_visit +
+    cart_abandon_rate +
+    device +
+    referral_source +
+    loyalty_member,
+  data = ecom_train
+) |>
+  update_role(customer_id, new_role = "ID") |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_log(income, base = 10, offset = 1) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_nzv(all_predictors()) #near-zero variance filter
+
+ecom_rec
+```
+
+::: {.callout-important title="Why normalization matters here"}
+`step_normalize()` is **essential** for KNN — which measures distance between customers in feature space. Without normalization, `income` (in the tens of thousands) would completely dominate `cart_abandon_rate` (0–1) simply because of scale differences, not because income is a stronger predictor.
+
+LDA, QDA, and Naïve Bayes are technically scale-invariant, but normalizing them too keeps the comparison fair and makes coefficient interpretation consistent.
+:::
+
+------------------------------------------------------------------------
+
+# Linear Discriminant Analysis (LDA)
+
+## How LDA Works
+
+Linear Discriminant Analysis finds linear combinations of predictors that **maximally separate** classes by maximizing between-class variance relative to within-class variance.
+
+LDA relies on two key statistical assumptions:
+
+1.  **Multivariate Normality:** Predictors ($X$) within each class follow a multivariate normal distribution.
+
+2.  **Homoscedasticity:** All classes share a common variance-covariance matrix (${\Sigma}$).
+
+Under these assumptions, LDA draws straight-line (linear) decision boundaries between classes.
+
+-   In other words, LDA computes linear decision boundaries (hyperplanes) where the probability of belonging to class $k$ equals the probability of belonging to class $l$.
+
+::: {.callout-note title="Decision Rule: Bayes' Theorem"}
+Instead of modeling class probabilities directly, LDA models $P(X \mid Y = k)$ (the distribution of predictors within each class) and applies **Bayes' Theorem** to find the posterior probability:
+
+$$P(Y = k \mid X = x) = \frac{\pi_k f_k(x)}{\sum_{l=1}^K \pi_l f_l(x)}$$
+
+Where:
+
+-   $\pi_k$ is the **prior probability** of class $k$ (estimated from class frequencies in the training data).
+
+-   $f_k(x)$ is the **density function** of $X$ for class $k$, assumed multivariate normal.
+:::
+
+::: {.callout-note title="LDA vs. Logistic Regression"}
+Both LDA and logistic regression produce linear decision boundaries. The difference is in *how* they get there:
+
+-   **Logistic regression** models $P(\text{class} | X)$ directly — it estimates the log-odds of each class given the predictors
+
+    -   Logistic Regression estimates $P(Y \mid X)$ directly via maximum likelihood without assuming how $X$ is distributed. It is preferred when predictors are categorical or clearly non-normal.
+
+-   **LDA** models $P(X | \text{class})$ — the distribution of predictors within each class — then uses Bayes' theorem to compute $P(\text{class} | X)$
+
+    -   LDA works generative-style by modeling $P(X \mid Y)$. It is generally more stable than logistic regression when classes are well-separated or when sample sizes are small (provided normality holds).
+
+In practice, they often give similar results. LDA has an edge when the normality assumption holds and classes are well-separated; logistic regression is more robust when it doesn't.
+:::
+
+## Key Takeaways for Model Selection
+
+-   **When to use LDA:** Continuous predictors that are approximately normally distributed, equal covariance across groups, and multi-class classification problems.
+
+-   **When to avoid LDA:** Predictors contain strong outliers, heavy skewness, or extreme non-linearities.
+
+-   **Next Steps if assumptions fail:**
+
+    -   If classes do **not** share the same covariance matrix, consider **Quadratic Discriminant Analysis (QDA)**, which creates parabolic/curved decision boundaries.
+
+    -   If predictors are heavily non-normal or categorical, rely on **Logistic Regression** or **Multinomial Regression**.
+
+## Fitting LDA
+
+```{r lda-fit}
+lda_spec <- discrim_linear() |>
+  set_engine("MASS") |>
+  set_mode("classification")
+
+lda_wf <- workflow() |>
+  add_recipe(ecom_rec) |>
+  add_model(lda_spec)
+
+lda_fit <- fit(lda_wf, data = ecom_train)
+
+# Predictions on test set
+lda_preds <- augment(lda_fit, new_data = ecom_test)
+
+# Confusion matrix
+conf_mat(lda_preds, truth = purchase_category, estimate = .pred_class)
+```
+
+```{r lda-metrics}
+lda_preds |>
+  metric_set(accuracy, sens, spec)(
+    truth = purchase_category,
+    estimate = .pred_class,
+    estimator = "macro"
+  )
+```
+
+------------------------------------------------------------------------
+
+# Quadratic Discriminant Analysis (QDA)
+
+## How QDA Works
+
+Quadratic Discriminant Analysis is a flexible alternative to LDA that allows for **curved (quadratic) decision boundaries** between classes.
+
+Like LDA, QDA assumes that the predictors ($X$) within each class follow a **multivariate normal distribution**. However, QDA relaxes LDA's strictest assumption regarding class variance:
+
+-   **LDA Assumption:** All classes share a common covariance matrix ($\boldsymbol{\Sigma}$).
+-   **QDA Assumption:** Each class has its **own separate covariance matrix** ($\boldsymbol{\Sigma}_k$).
+
+Because each class gets its own variance-covariance structure, the quadratic terms in Bayes' Theorem do not cancel out. This allows the model to draw parabolic, hyperbolic, or elliptical boundaries around classes in the feature space.
+
+::: {.callout-note title="Decision Rule & Boundary Geometry"}
+Under QDA, the decision boundary between class $k$ and class $l$ occurs where their posterior probabilities are equal ($P(Y = k \mid X) = P(Y = l \mid X)$).
+
+Because ${\Sigma}_k \neq {\Sigma}_l$, the resulting equation contains squared terms ($X^2$), creating a quadratic decision surface rather than a flat plane.
+:::
+
+::: {.callout-warning title="The Trade-off: Flexibility vs. Variance"}
+Relaxing the equal covariance assumption comes at a computational cost:
+
+-   **LDA** estimates a single pooled covariance matrix with $p(p+1)/2$ parameters (where $p$ is the number of predictors).
+-   **QDA** estimates $K$ separate covariance matrices, requiring $K \times [p(p+1)/2]$ parameters.
+
+**Rule of thumb:** QDA needs significantly **larger training sample sizes** to estimate class-specific covariances reliably. If sample sizes are small, QDA is prone to overfitting.
+:::
+
+## How QDA Differs from LDA
+
+QDA relaxes LDA's equal-covariance assumption — each class is allowed its own covariance matrix. This produces **curved (quadratic) decision boundaries**, making QDA more flexible than LDA.
+
+::: {.callout-note title="LDA vs. QDA — the bias-variance tradeoff"}
+|  |  |  |
+|------------------------|------------------------|------------------------|
+| **Characteristic** | **Linear Discriminant Analysis (LDA)** | **Quadratic Discriminant Analysis (QDA)** |
+| **Decision Boundary** | Straight line / Flat plane | Curved / Quadratic boundary |
+| **Covariance Assumption** | Equal across classes (${\Sigma}_1 = {\Sigma}_2 = \dots$) | Class-specific (${\Sigma}_k$ per group) |
+| **Model Complexity** | Low (fewer parameters) | High (more parameters) |
+| **Risk of Overfitting** | Lower (higher bias, lower variance) | Higher (lower bias, higher variance) |
+| **Sample Size Requirement** | Works well with smaller $N$ | Requires larger $N$ per class |
+
+This is the same bias-variance tradeoff you saw with Lasso (simpler) vs. random forest (more flexible) — more flexibility reduces bias but increases variance.
+:::
+
+## Fitting QDA
+
+::: {.callout-warning title="QDA can be more fragile than LDA"}
+QDA estimates a separate covariance matrix for each class. If a fold has predictors with almost no variation or strong collinearity, QDA can fail. The recipe uses `step_zv()` and `step_nzv()` to remove zero-variance and near-zero-variance predictors before fitting.
+:::
+
+```{r qda-fit}
+qda_spec <- discrim_quad() |>
+  set_engine("MASS") |>
+  set_mode("classification")
+
+qda_wf <- workflow() |>
+  add_recipe(ecom_rec) |>
+  add_model(qda_spec)
+
+qda_fit <- fit(qda_wf, data = ecom_train)
+
+qda_preds <- augment(qda_fit, new_data = ecom_test)
+
+conf_mat(qda_preds, truth = purchase_category, estimate = .pred_class)
+```
+
+```{r qda-metrics}
+qda_preds |>
+  metric_set(accuracy, sens, spec)(
+    truth = purchase_category,
+    estimate = .pred_class,
+    estimator = "macro"
+  )
+```
+
+------------------------------------------------------------------------
+
+# Naïve Bayes Classifier
+
+## How Naïve Bayes Works
+
+The Naïve Bayes classifier is a probabilistic machine learning model based on **Bayes' Theorem**. It computes the probability that an observation belongs to class $k$ given its set of predictors $X_1, X_2, \dots, X_p$:
+
+$$P(Y = k \mid X_1, \dots, X_p) = \frac{P(Y = k) \prod_{j=1}^p P(X_j \mid Y = k)}{P(X_1, \dots, X_p)}$$
+
+### Component-by-Component Meaning
+
+#### 1. Left Side: The Goal
+
+-   $P(Y = k \mid X_1, \dots, X_p)$ — Posterior Probability
+
+    -   **What it means:** The updated probability that a customer belongs to **Class** $k$ (e.g., `"electronics"`), given that we have observed their specific feature values ($X_1, \dots, X_p$).
+
+    -   **In simple words:** *"After looking at this customer's profile, what are the odds they bought electronics?"*
+
+#### 2. Numerator: The Driving Forces
+
+-   $P(Y = k)$ — **Prior Probability**
+
+    -   **What it means:** The baseline probability of seeing Class $k$ in the dataset before looking at any of the customer's features ($X$).
+
+    -   **In simple words:** *"Out of all overall historical orders, what percentage were for electronics?"* (e.g., 25% of all purchases).
+
+-   $\prod_{j=1}^p P(X_j \mid Y = k)$ — **Class Conditional Likelihood**
+
+    -   **What it means:** The combined product of seeing each predictor value individually, assuming the customer is in Class $k$.
+
+    -   **In simple words:** *"If a customer buys electronics, how likely is it that they simultaneously use a desktop, earn high income, and browse for 20 minutes?"*
+
+#### 3. Denominator: The Normalizing Constant
+
+-   $P(X_1, \dots, X_p)$ — Marginal Likelihood (Predictor Density)
+
+    -   **What it means:** The total probability of observing that specific combination of features ($X_1, \dots, X_p$) across **all classes combined**.
+
+    -   **Mathematical expansion:** It is calculated by summing the numerator across every possible class:
+
+      $$
+      P(X_1, \dots, X_p) = \sum_{\text{all c}} \left( P(Y = c) \prod_{j=1}^p P(X_j \mid Y = c) \right)
+      $$
+
+-   **In simple words:** *"How common is a high-earning, desktop-using, 20-minute browser across our entire customer base regardless of what they buy?"*
+
+-   **Why it matters:** It acts as a scaling factor that shrinks or stretches the numerator so that the resulting probabilities across all classes (apparel, beauty, electronics) sum up to exactly **1.0 (100%)**.
+
+Sometimes, the above formula can be expressed as: 
+$$
+P(\text{class} | X_1, X_2, \ldots, X_p) \propto P(\text{class}) \times \prod_{j=1}^{p} P(X_j | \text{class})
+$$ 
+Here is why mathematicians and data scientists switch between them, and why dropping that denominator makes complete sense when making predictions.
+
+### Step 1: The Full Formula vs. The Proportional Form
+
+Here is the full Bayes' Theorem version given earlier:
+
+$$
+P(\text{class} \mid X_1, \dots, X_p) = \frac{P(\text{class}) \times \prod_{j=1}^p P(X_j \mid \text{class})}{P(X_1, \dots, X_p)}
+$$
+
+Notice the denominator: $P(X_1, \dots, X_p)$.
+
+This represents the overall probability of seeing that exact combination of predictor values across your entire dataset.
+
+### Step 2: Why We Can Drop the Denominator
+
+When Naïve Bayes makes a prediction for a single customer, it calculates a score for **every possible class** (e.g., Apparel, Electronics, Beauty) using that customer's feature values:
+
+-   Score for **Apparel**: $\frac{P(\text{Apparel}) \times \prod P(X_j \mid \text{Apparel})}{P(X_1, \dots, X_p)}$
+
+-   Score for **Electronics**: $\frac{P(\text{Electronics}) \times \prod P(X_j \mid \text{Electronics})}{P(X_1, \dots, X_p)}$
+
+-   Score for **Beauty**: $\frac{P(\text{Beauty}) \times \prod P(X_j \mid \text{Beauty})}{P(X_1, \dots, X_p)}$
+
+Notice that the bottom number, $P(X_1, \dots, X_p)$, **is identical in all three calculations**. It is a constant for that specific observation.
+
+Because the denominator never changes across classes, it does not affect **which class gets the highest score**.
+
+Therefore, we can drop $P(X_1, \dots, X_p)$ and state that the probability is **proportional to** ($\propto$) the numerator:
+
+$$
+P(\text{class} \mid X_1, \dots, X_p) \propto P(\text{class}) \times \prod_{j=1}^p P(X_j \mid \text{class})
+$$
+
+#### Concrete Example from the E-Commerce Data
+
+Suppose you want to calculate the score for $Y = \text{"electronics"}$ for a specific customer who has $p = 3$ features:
+
+1.  $X_1$: Device is **Desktop**
+
+2.  $X_2$: Income is **High**
+
+3.  $X_3$: Loyalty member is **Yes**
+
+Expanding the $\prod$ notation gives you three individual conditional probabilities multiplied together:
+
+$$
+\prod_{j=1}^3 P(X_j \mid Y = \text{electronics}) = P(X_1 = \text{Desktop} \mid \text{electronics}) \times P(X_2 = \text{High} \mid \text{electronics}) \times P(X_3 = \text{Yes} \mid \text{electronics}
+$$
+
+Each piece asks a simple historical question from your training data:
+
+-   $P(\text{Desktop} \mid \text{electronics})$: *"Out of all past electronics purchases, what fraction were made on a desktop?"*
+
+-   $P(\text{High Income} \mid \text{electronics})$: *"Out of all past electronics purchases, what fraction were made by high earners?"*
+
+-   $P(\text{Loyalty} \mid \text{electronics})$: *"Out of all past electronics purchases, what fraction were loyalty members?"*
+
+Multiplying them together combines these feature likelihoods under the "naïve" assumption that each feature acts independently.
+
+### Step 3: Which Version Should You Use in Your Codebook?
+
+|  |  |  |
+|------------------------|------------------------|------------------------|
+| **Formula** | **Purpose** | **When to Use** |
+| **Full Equation** ($=$ with Denominator) | Computes actual **probabilities** that sum to $1.0$ (e.g., 70% Apparel, 20% Electronics, 10% Beauty). | Use when explaining how R calculates `.pred_apparel`, `.pred_beauty`, etc., via softmax/normalization. |
+| **Proportional Equation** ($\propto$) | Focuses purely on **classification score** to pick the winner (`argmax`). | Use when explaining the computational shortcut that Naïve Bayes uses internally to run quickly. |
+
+### The "Naïve" Assumption
+
+Estimating joint probability distributions across many predictors simultaneously requires immense amounts of data. Naïve Bayes simplifies this by making a strong **conditional independence assumption**:
+
+> **Assumption:** Given the class label $Y$, all predictors $X_1, X_2, \dots, X_p$ are completely independent of one another.
+
+In real-world data, predictors are rarely truly independent (e.g., browsing time and pages viewed are usually correlated). However, even when this assumption is violated, Naïve Bayes often performs surprisingly well in practice—especially for high-dimensional data or text classification.
+
+::: {.callout-note title="Handling Different Data Types"}
+How Naïve Bayes models $P(X_j \mid Y = k)$ depends on the variable type:
+
+-   **Categorical Predictors:** Uses simple frequency counts (contingency tables) to calculate relative frequencies.
+-   **Continuous Predictors:** Typically assumes a **Gaussian (Normal) distribution** within each class, or uses kernel density estimation (KDE) to estimate non-parametric shapes.
+:::
+
+::: {.callout-warning title="The Zero-Probability Problem"}
+If a categorical predictor level never appears alongside a specific class in the training data, $P(X_j \mid Y = k) = 0$. Because probabilities are multiplied together, a single zero causes the entire class probability to become zero.
+
+To prevent this, models apply **Laplace Smoothing** (adding a small constant, usually $1$, to count estimates).
+:::
+
+## Fitting Naïve Bayes
+
+```{r nb-fit}
+
+nb_spec <- naive_Bayes() |>
+  set_engine("klaR") |>
+  set_mode("classification")
+
+nb_wf <- workflow() |>
+  add_recipe(ecom_rec) |>
+  add_model(nb_spec)
+
+nb_fit <- fit(nb_wf, data = ecom_train)
+nb_preds <- augment(nb_fit, new_data = ecom_test)
+
+conf_mat(nb_preds, truth = purchase_category, estimate = .pred_class)
+```
+
+```{r nb-metrics}
+nb_preds |>
+  metric_set(accuracy, sens, spec)(
+    truth = purchase_category,
+    estimate = .pred_class,
+    estimator = "macro"
+  )
+```
+
+------------------------------------------------------------------------
+
+# K-Nearest Neighbors (KNN)
+
+## How $k$-NN Works
+
+Unlike model-based algorithms like Naïve Bayes or Discriminant Analysis, $k$-Nearest Neighbors is a **non-parametric, instance-based** (or "lazy") algorithm. It makes no assumptions about the underlying distribution of the data (such as normality) and does not learn fixed parameters during a training phase.
+
+When predicting the class for a new observation, $k$-NN operates through three main steps:
+
+1. **Calculate Distance:** Measures the distance between the new observation and every point in the training dataset using a distance metric (most commonly **Euclidean distance** for continuous features).
+2. **Find $k$ Neighbors:** Identifies the $k$ closest training observations in the feature space.
+3. **Majority Vote:** Assigns the new observation to the class that is most common among its $k$ nearest neighbors (or averages their predicted probabilities).
+
+$$
+d(\mathbf{x}, \mathbf{y}) = \sqrt{\sum_{j=1}^p (x_j - y_j)^2}
+$$
+
+::: {.callout-important title="Critical Step: Feature Scaling"}
+Because $k$-NN relies entirely on distance calculations, **features on larger scales will dominate the distance metric**. 
+
+For example, a difference of $\$10,000$ in income would completely overshadow a difference of $5$ browsing minutes or $2$ pages viewed. 
+
+**Rule:** You must always **center and scale** (standardize) continuous predictors before running $k$-NN so each feature contributes equally to distance.
+:::
+
+::: {.callout-note title="Choosing the Parameter $k$"}
+The hyperparameter $k$ controls the trade-off between **bias and variance**:
+
+* **Small $k$ (e.g., $k = 1$):** Highly flexible, non-linear decision boundaries. Low bias, but high variance (extremely sensitive to noisy data and outliers).
+* **Large $k$ (e.g., $k = 100$):** Smoother decision boundaries. Low variance, but high bias (may oversimplify patterns and mask small class regions).
+
+Typically, $k$ is chosen via **cross-validation**, and an odd number is selected for binary classification to prevent tied votes.
+:::
+
+::: {.callout-note title="The effect of k"}
+| Small k (e.g., k=1) | Large k (e.g., k=50) |
+|------------------------------------|------------------------------------|
+| Very flexible — fits every local quirk | Smoother — averages over many neighbors |
+| Low bias, high variance | Higher bias, lower variance |
+| Overfits easily | May underfit |
+
+Choosing k is a hyperparameter tuning problem — in practice, we search over a range of k values using cross-validation. Here we use k = 10 as a reasonable starting value.
+:::
+
+## Fitting KNN
+
+```{r knn-fit}
+knn_spec <- nearest_neighbor(neighbors = 10) |>
+  set_engine("kknn") |>
+  set_mode("classification")
+
+knn_wf <- workflow() |>
+  add_recipe(ecom_rec) |>
+  add_model(knn_spec)
+
+knn_fit <- fit(knn_wf, data = ecom_train)
+knn_preds <- augment(knn_fit, new_data = ecom_test)
+
+conf_mat(knn_preds, truth = purchase_category, estimate = .pred_class)
+```
+
+```{r knn-metrics}
+knn_preds |>
+  metric_set(accuracy, sens, spec)(
+    truth = purchase_category,
+    estimate = .pred_class,
+    estimator = "macro"
+  )
+```
+
+------------------------------------------------------------------------
+
+# Comparing All Four Classifiers
+
+## Cross-Validated Comparison
+
+A fair comparison requires evaluating all models on the **same resampling scheme** — not just on the single test set, where luck of the split can favor one model.
+
+```{r cv-compare}
+set.seed(2025)
+ecom_folds <- vfold_cv(ecom_train, v = 10, strata = purchase_category)
+
+# Helper to fit any workflow and collect CV metrics
+cv_metrics <- function(wf, label) {
+  fit_resamples(
+    wf,
+    resamples = ecom_folds,
+    metrics = metric_set(accuracy, roc_auc),
+    control = control_resamples(save_pred = TRUE)
+  ) |>
+    collect_metrics() |>
+    mutate(model = label)
+}
+
+lda_cv <- cv_metrics(lda_wf, "LDA")
+qda_cv <- cv_metrics(qda_wf, "QDA")
+nb_cv <- cv_metrics(nb_wf, "Naive Bayes")
+knn_cv <- cv_metrics(knn_wf, "KNN (k=10)")
+
+bind_rows(lda_cv, qda_cv, nb_cv, knn_cv) |>
+  select(model, .metric, mean, std_err) |>
+  arrange(.metric, desc(mean))
+```
+
+```{r cv-plot}
+bind_rows(lda_cv, qda_cv, nb_cv, knn_cv) |>
+  filter(.metric == "accuracy") |>
+  ggplot(aes(x = reorder(model, mean), y = mean)) +
+  geom_col(fill = "#154734", alpha = 0.85) +
+  geom_errorbar(
+    aes(ymin = mean - std_err, ymax = mean + std_err),
+    width = 0.3,
+    color = "#B08D57",
+    linewidth = 0.8
+  ) +
+  coord_flip() +
+  labs(
+    title = "10-Fold CV Accuracy — Four Classifiers",
+    subtitle = "Error bars show ± 1 standard error",
+    x = NULL,
+    y = "Mean accuracy"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+::: {.callout-note title="Interpreting the comparison"}
+Standard errors that overlap between models suggest the performance difference is **not meaningful** — the models are essentially tied within sampling variability. A model that is simpler (LDA) but achieves the same accuracy as a more complex model (QDA) is generally preferable — fewer parameters means lower risk of overfitting on new data.
+:::
+
+------------------------------------------------------------------------
+
+# Poisson Regression
+
+::: {.callout-important title="Poisson regression is not a classifier"}
+LDA, QDA, Naïve Bayes, and KNN predict class labels such as `apparel`, `electronics`, or `beauty`. Poisson regression predicts a **count** such as the number of orders. It belongs in this module because it is another generalized linear model, but it should not be interpreted as a classification model.
+:::
+
+## Count Outcomes in Marketing
+
+Many marketing outcomes are **counts** — not continuous values, not binary labels, but non-negative integers:
+
+-   Number of orders placed in a year
+-   Number of website sessions per month
+-   Number of items in a cart
+-   Number of customer service calls
+
+Linear regression is a poor fit for counts because it can predict negative values and doesn't respect the discrete, non-negative nature of the outcome. **Poisson regression** is designed for exactly this case.
+
+## The Poisson Model
+
+Poisson regression models the **log of the expected count** as a linear function of predictors:
+
+$$\log(\lambda) = \beta_0 + \beta_1 X_1 + \ldots + \beta_p X_p$$
+
+where $\lambda = E[\text{count}]$. Exponentiating both sides:
+
+$$\lambda = e^{\beta_0 + \beta_1 X_1 + \ldots + \beta_p X_p}$$
+
+This ensures the predicted count is always positive, and the coefficients have a multiplicative interpretation — similar to odds ratios in logistic regression.
+
+::: {.callout-note title="Interpreting Poisson coefficients"}
+Just as in logistic regression where $e^\beta$ gives an odds ratio, in Poisson regression:
+
+$$e^\beta = \text{rate ratio}$$
+
+A coefficient of 0.04 for `browsing_mins` means:
+
+$$e^{0.04} \approx 1.041$$
+
+Each additional minute of daily browsing is associated with a **4.1% increase** in the expected number of orders, holding all else constant.
+:::
+
+## Fitting Poisson Regression
+
+```{r poisson-recipe}
+# Separate recipe for Poisson (continuous outcome, not purchase_category)
+poisson_rec <- recipe(
+  num_orders ~ browsing_mins +
+    pages_viewed +
+    days_since_visit +
+    cart_abandon_rate +
+    loyalty_member +
+    device +
+    referral_source,
+  data = ecom_train
+) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_nzv(all_predictors())
+```
+
+```{r poisson-fit}
+poisson_spec <- poisson_reg() |>
+  set_engine("glm") |>
+  set_mode("regression")
+
+poisson_wf <- workflow() |>
+  add_recipe(poisson_rec) |>
+  add_model(poisson_spec)
+
+poisson_fit <- fit(poisson_wf, data = ecom_train)
+
+# Tidy coefficients with rate ratios
+poisson_fit |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  filter(term != "(Intercept)") |>
+  mutate(rate_ratio = round(exp(estimate), 3)) |>
+  arrange(desc(abs(estimate)))
+```
+
+```{r poisson-predict}
+poisson_preds <- augment(poisson_fit, new_data = ecom_test)
+
+# Regression metrics for count predictions
+poisson_preds |>
+  metric_set(rmse, mae)(truth = num_orders, estimate = .pred)
+
+# Predicted vs actual plot
+ggplot(poisson_preds, aes(x = num_orders, y = .pred)) +
+  geom_jitter(alpha = 0.3, color = "#154734", width = 0.2) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "#B08D57"
+  ) +
+  labs(
+    title = "Poisson Regression — Predicted vs. Actual Orders",
+    subtitle = "Dashed line = perfect prediction",
+    x = "Actual number of orders",
+    y = "Predicted number of orders"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+::: {.callout-note title="When to use Poisson vs. Linear Regression"}
+Use **Poisson regression** when:
+
+-   The outcome is a non-negative integer count
+-   The variance tends to increase with the mean (overdispersion is common)
+-   Predicting negative values is nonsensical
+
+Use **linear regression** when:
+
+-   The outcome is continuous and can plausibly be negative
+-   The errors are approximately normally distributed
+
+For `num_orders` in a marketing context, Poisson is the appropriate choice — it's impossible to place −2 orders.
+:::
+
+------------------------------------------------------------------------
+
+# K-Means Clustering
+
+## Supervised vs. Unsupervised Learning
+
+So far in this module every model had a labeled outcome — `purchase_category` or `num_orders`. What if we have no labels at all?
+
+::: {.callout-note title="The key distinction"}
+|   | Supervised | Unsupervised |
+|------------------------|------------------------|------------------------|
+| Outcome variable | Required (labels exist) | None |
+| Goal | Predict a known outcome | Discover hidden structure |
+| Evaluation | Accuracy, AUC, RMSE | Silhouette score, business interpretation |
+| Marketing example | Predict who will churn | Discover natural customer segments |
+:::
+
+**K-means clustering** partitions customers into k groups such that customers within each group are as similar as possible (minimize within-cluster variance) and customers across groups are as different as possible (maximize between-cluster variance).
+
+## How $k$-Means Works
+
+Unlike classification models (like LDA, Naïve Bayes, or $k$-NN), $k$-Means is an **unsupervised learning algorithm**. It does not use target labels ($Y$). Instead, it searches for hidden structure by partitioning unlabeled observations ($X$) into $k$ distinct, non-overlapping groups (clusters) based on feature similarity.
+
+The objective of $k$-Means is to minimize the **Within-Cluster Variance** (also called Within-Cluster Sum of Squares, WSS). It aims to make points inside the same cluster as tight and similar to one another as possible.
+
+$$\text{Minimize } \sum_{k=1}^K \sum_{i \in C_k} \sum_{j=1}^p (x_{ij} - \mu_{kj})^2$$
+
+Where $\mu_{kj}$ is the **centroid** (mean value) of predictor $j$ for cluster $k$.
+
+---
+
+## The Iterative Algorithm
+
+$k$-Means uses a simple 4-step expectation-maximization approach to find optimal clusters:
+
+1. **Initialization:** Randomly select $k$ observations from the dataset to act as initial cluster centroids.
+2. **Assignment Step:** Assign every observation to its nearest centroid based on **Euclidean distance**.
+3. **Update Step:** Recalculate each centroid by taking the mean of all data points currently assigned to that cluster.
+4. **Repeat:** Alternate between steps 2 and 3 until cluster assignments stop changing (convergence) or the maximum number of iterations is reached.
+
+::: {.callout-important title="Critical Step: Feature Scaling"}
+Just like $k$-NN, $k$-Means calculates Euclidean distances between observations. 
+
+If one variable has a large range (e.g., `income` from $\$20,000$ to $\$150,000$) and another has a small range (e.g., `pages_viewed` from $1$ to $12$), `income` will completely dominate the distance calculations and skew cluster formation.
+
+**Rule:** Always **center and scale** numeric features before applying $k$-Means clustering (`scale()` or `step_normalize()`).
+:::
+
+::: {.callout-note title="Sensitivity to Initial Centroids"}
+Because $k$-Means starts by choosing initial centroids randomly, it can sometimes get stuck in a **local minimum** rather than finding the globally optimal clusters. 
+
+To prevent this, R runs $k$-Means multiple times with different random starting configurations using the `nstart` argument (e.g., `nstart = 25`) and keeps the best result with the lowest total WSS.
+:::
+
+---
+
+## Preparing Data for Clustering
+
+K-means operates on numeric features only and is sensitive to scale — `step_normalize()` is essential.
+
+```{r cluster-prep}
+cluster_rec <- recipe(
+  ~ age +
+    income +
+    browsing_mins +
+    pages_viewed +
+    days_since_visit +
+    cart_abandon_rate,
+  data = ecom_train
+) |>
+  step_log(income, base = 10, offset = 1) |>
+  step_normalize(all_numeric_predictors())
+
+cluster_data <- cluster_rec |>
+  prep() |>
+  bake(new_data = NULL)
+
+head(cluster_data)
+```
+
+## Choosing k — Elbow Method
+
+The elbow method plots total within-cluster sum of squares (WSS) against k. We look for the point where adding more clusters stops producing meaningful reductions in WSS — the "elbow."
+
+```{r elbow}
+set.seed(2025)
+fviz_nbclust(
+  cluster_data,
+  kmeans,
+  method = "wss",
+  k.max = 10,
+  nstart = 25
+) +
+  labs(
+    title = "Elbow Method — Total Within-Cluster Sum of Squares",
+    subtitle = "Look for the point where the curve bends ('elbow')"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Choosing k — Silhouette Method
+
+The silhouette score measures how similar each customer is to its own cluster compared to other clusters. Values range from −1 to +1 — higher is better. The optimal k maximizes the average silhouette width.
+
+```{r silhouette}
+set.seed(2025)
+fviz_nbclust(
+  cluster_data,
+  kmeans,
+  method = "silhouette",
+  k.max = 10,
+  nstart = 25
+) +
+  labs(
+    title = "Silhouette Method — Average Silhouette Width",
+    subtitle = "Higher silhouette width = better-defined clusters"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+::: {.callout-note title="Elbow vs. Silhouette — when they disagree"}
+The elbow and silhouette methods often suggest slightly different values of k. When they disagree:
+
+-   Prefer the **silhouette** method if you want statistically well-separated clusters
+-   Prefer the **elbow** method if you want a specific number of clusters that are still meaningfully distinct
+-   Always consider **business interpretability** — 3 segments a marketing team can name and act on is more useful than 7 statistically optimal segments no one can explain
+:::
+
+## Fitting K-Means
+
+```{r kmeans-fit}
+set.seed(2025)
+km_fit <- kmeans(cluster_data, centers = 3, nstart = 25)
+
+# How many customers in each segment?
+table(km_fit$cluster)
+```
+
+```{r kmeans-viz}
+fviz_cluster(
+  km_fit,
+  data = cluster_data,
+  geom = "point",
+  ellipse = TRUE,
+  palette = c("#154734", "#B08D57", "#4F8A8B"),
+  ggtheme = theme_minimal(base_size = 12)
+) +
+  labs(
+    title = "K-Means Clustering — 3 Segments",
+    subtitle = "Visualized on first two principal components"
+  )
+```
+
+## Profiling the Segments
+
+The cluster numbers (1, 2, 3) are arbitrary labels — what matters is what each cluster *means* in marketing terms. We profile segments by computing the mean of each original variable within each cluster.
+
+```{r segment-profile}
+ecom_train |>
+  mutate(segment = factor(km_fit$cluster)) |>
+  group_by(segment) |>
+  summarise(
+    n = n(),
+    avg_age = round(mean(age), 1),
+    avg_income = round(mean(income, na.rm = TRUE)),
+    avg_browsing_mins = round(mean(browsing_mins), 1),
+    avg_pages_viewed = round(mean(pages_viewed), 1),
+    avg_days_since = round(mean(days_since_visit), 1),
+    avg_abandon_rate = round(mean(cart_abandon_rate), 2),
+    pct_loyalty = round(mean(loyalty_member == "yes") * 100, 1),
+    pct_mobile = round(mean(device == "mobile") * 100, 1),
+    pct_apparel = round(mean(purchase_category == "apparel") * 100, 1),
+    pct_electronics = round(mean(purchase_category == "electronics") * 100, 1),
+    pct_beauty = round(mean(purchase_category == "beauty") * 100, 1),
+    avg_orders = round(mean(num_orders), 1)
+  )
+```
+
+::: {.callout-note title="Naming the segments"}
+Use the profile table to give each segment a business-meaningful name. For example:
+
+-   **High engagement loyalists** — high browsing, low abandonment, loyalty member, many orders
+-   **Occasional browsers** — moderate browsing, high abandonment, infrequent orders
+-   **Information seekers** — more paegs reviewd, higher income, greater abandonment and apparels
+
+Giving segments names that a marketing team can act on is the difference between a clustering exercise and a clustering *result*.
+:::
+
+## Using Cluster Membership as a Feature
+
+One powerful application of clustering is to add segment membership as a new feature in a supervised model — combining unsupervised discovery with supervised prediction.
+
+```{r cluster-feature}
+# Add cluster assignment to training and test data
+ecom_train_cl <- ecom_train |>
+  mutate(segment = factor(km_fit$cluster))
+
+# For test data: assign each customer to the nearest training cluster center.
+# This helper avoids relying on an extra package such as ClusterR.
+assign_to_nearest_center <- function(new_data, centers) {
+  new_mat <- as.matrix(new_data)
+  center_mat <- as.matrix(centers)
+
+  apply(new_mat, 1, function(row_values) {
+    squared_distances <- rowSums(
+      sweep(center_mat, 2, row_values, FUN = "-")^2
+    )
+    which.min(squared_distances)
+  })
+}
+
+test_cluster_data <- cluster_rec |>
+  prep() |>
+  bake(new_data = ecom_test)
+
+test_assignments <- assign_to_nearest_center(
+  new_data = test_cluster_data,
+  centers = km_fit$centers
+)
+
+ecom_test_cl <- ecom_test |>
+  mutate(
+    segment = factor(test_assignments, levels = sort(unique(km_fit$cluster)))
+  )
+
+cat("Segment distribution in test set:\n")
+table(ecom_test_cl$segment)
+```
+
+::: {.callout-note title="Why add cluster membership to a supervised model?"}
+Cluster membership captures **nonlinear interaction patterns** that individual variables might not. A customer's engagement score interacts with their loyalty status in complex ways — a cluster that captures "high-engagement loyalty member who browses on mobile" encodes that combination as a single feature, which a linear model can then use directly.
+
+This is sometimes called a **two-stage model**: unsupervised segmentation first, then supervised prediction using segment membership as an additional predictor.
+:::
+
+------------------------------------------------------------------------
+
+# Summary
+
+## Classifier Comparison
+
+| Model | Decision Boundary | Key Assumption | Best When |
+|------------------|------------------|------------------|------------------|
+| **LDA** | Linear | Equal covariance across classes; normality | Classes well-separated; small n |
+| **QDA** | Quadratic | Per-class covariance; normality | Classes have different spread; larger n |
+| **Naïve Bayes** | Depends on distribution | Predictor independence given class | Many predictors; text data |
+| **KNN** | Non-parametric | Local similarity | Complex, non-linear boundaries; scale invariant after normalization |
+| **Poisson Regression** | — (count regression) | Count outcome; mean = variance | Non-negative integer outcomes |
+
+## Supervised vs. Unsupervised
+
+|   | Classification | Clustering |
+|------------------------|------------------------|------------------------|
+| Outcome | Labeled (`purchase_category`) | None |
+| Goal | Predict known classes | Discover natural groups |
+| Evaluation | Accuracy, AUC | Silhouette, business interpretation |
+| tidymodels | `workflow()` + `fit_resamples()` | `kmeans()` + `fviz_*()` |
+
+------------------------------------------------------------------------
+
+# Exercises
+
+## ✏️ Exercise 5.1 — LDA vs. QDA Decision
+
+Run the cross-validated comparison in Section 6 and compare LDA vs. QDA accuracy and their standard errors.
+
+1.  Is QDA's accuracy meaningfully higher than LDA's, or do their confidence intervals overlap? What does this suggest about whether the equal-covariance assumption holds for this dataset?
+2.  Which model would you recommend deploying, and why? Consider both performance and parsimony (model simplicity) in your answer.
+
+```{r ex5-1, eval=FALSE}
+# Your code here
+
+```
+
+## ✏️ Exercise 5.2 — Naïve Bayes and the Independence Assumption
+
+The Naïve Bayes model assumes predictors are conditionally independent given the class.
+
+1.  Check whether `browsing_mins` and `pages_viewed` are correlated in `ecom_train` using `cor()`. Does the independence assumption hold for these two predictors?
+2.  Despite this violation, Naïve Bayes may still perform reasonably well. Run the CV comparison and check whether its accuracy is close to the other models. What does this tell you about the "naïve" assumption in practice?
+
+```{r ex5-2, eval=FALSE}
+# Your code here
+
+```
+
+## ✏️ Exercise 5.3 — KNN Sensitivity to k
+
+Refit the KNN model using `neighbors = 1`, `neighbors = 5`, and `neighbors = 50`. Use `fit_resamples()` to compare cross-validated accuracy for all three values of k alongside the original k = 10.
+
+1.  Which value of k produces the highest training accuracy? Which produces the highest CV accuracy? Why do they differ?
+2.  What does the pattern across k values tell you about the bias-variance tradeoff?
+
+```{r ex5-3, eval=FALSE}
+# Your code here
+
+```
+
+## ✏️ Exercise 5.4 — Poisson Rate Ratios
+
+From the Poisson regression output:
+
+1.  Identify the predictor with the largest rate ratio. Interpret it in a complete marketing-relevant sentence.
+2.  Interpret the coefficient for `loyalty_member_yes`. How many more orders per year do loyalty members place compared to non-members, expressed as a percentage increase?
+3.  A customer has `cart_abandon_rate = 0.80` (very high). Based on the model, what does this predict about their order volume relative to a customer with `cart_abandon_rate = 0.20`? Compute the rate ratio for this comparison.
+
+```{r ex5-4, eval=FALSE}
+# Your code here
+
+```
+
+## ✏️ Exercise 5.5 — Segment Interpretation and Marketing Action
+
+Using the segment profile table from Section 8.4:
+
+1.  Give each of the three segments a descriptive marketing name based on their profile characteristics.
+2.  For each segment, propose one specific marketing action — a campaign type, channel, offer, or message — that would be appropriate given the segment's characteristics.
+3.  One of the segments likely has the highest average number of orders. Is that segment also the one with the highest loyalty membership rate? What does the relationship (or lack thereof) between orders and loyalty membership tell you about the drivers of purchase frequency in this dataset?
+
+```{r ex5-5, eval=FALSE}
+# Your code here
+
+```
