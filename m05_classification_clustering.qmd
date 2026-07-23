@@ -20,7 +20,7 @@ format:
 execute:
   warning: false
   message: false
-  # freeze: true  # Turn back on after the notebook renders cleanly
+  freeze: true  # Turn back on after the notebook renders cleanly
 ---
 
 # Learning Objectives {.unnumbered}
